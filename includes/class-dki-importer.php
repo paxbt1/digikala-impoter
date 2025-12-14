@@ -200,10 +200,11 @@ class DKI_Importer {
 
         // Images: set featured + gallery
         if (!empty($dk['images']) && is_array($dk['images'])) {
-            self::set_images($product_id, $dk['images'], $dk['title'] ?? '');
+            $alt = self::compute_image_alt($dk);
+            self::set_images($product_id, $dk['images'], $dk['title'] ?? '', $alt);
         }
 
-        // Append credit link to digikala (SEO-safe: normal link, optional nofollow via option)
+        // Append credit link to digikala (optional)
         if ($source_url) {
             self::append_credit_link($product_id, $source_url);
         }
@@ -212,8 +213,18 @@ class DKI_Importer {
     }
 
     private static function append_credit_link(int $product_id, string $source_url): void {
+        $enabled = get_option('dki_credit_enabled', '1') === '1';
+        if (!$enabled) {
+            return;
+        }
+
         $nofollow = get_option('dki_credit_nofollow', '1') === '1';
+        $text_mode = get_option('dki_credit_text_mode', 'default');
+        $custom_text = (string)get_option('dki_credit_text_custom', '');
         $anchor = 'مشاهده در دیجی‌کالا';
+        if ($text_mode === 'custom' && trim($custom_text) !== '') {
+            $anchor = trim($custom_text);
+        }
         $rel = $nofollow ? 'nofollow noopener' : 'noopener';
         $html = '<p class="dki-credit"><a href="' . esc_url($source_url) . '" target="_blank" rel="' . esc_attr($rel) . '">' . esc_html($anchor) . '</a></p>';
 
@@ -347,7 +358,23 @@ class DKI_Importer {
         update_post_meta($product_id, '_product_attributes', $existing);
     }
 
-    private static function set_images(int $product_id, array $urls, string $desc = ''): void {
+    private static function compute_image_alt(array $dk): string {
+        $mode = get_option('dki_image_alt_mode', 'product');
+        $mode = is_string($mode) ? $mode : 'product';
+
+        $title = isset($dk['title']) ? wp_strip_all_tags((string) $dk['title']) : '';
+
+        if ($mode === 'fixed') {
+            $fixed = get_option('dki_image_alt_fixed', '');
+            $fixed = wp_strip_all_tags(is_string($fixed) ? $fixed : '');
+            return trim($fixed);
+        }
+
+        // default: product title
+        return trim($title);
+    }
+
+    private static function set_images(int $product_id, array $urls, string $desc = '', string $alt = ''): void {
         if (!function_exists('media_handle_sideload')) {
             require_once ABSPATH . 'wp-admin/includes/media.php';
             require_once ABSPATH . 'wp-admin/includes/file.php';
@@ -362,6 +389,9 @@ class DKI_Importer {
             // try to dedupe by meta _dki_image_source
             $existing = self::find_attachment_by_source($u);
             if ($existing) {
+                if ($alt !== '') {
+                    update_post_meta($existing, '_wp_attachment_image_alt', $alt);
+                }
                 $attachment_ids[] = $existing;
                 continue;
             }
@@ -379,6 +409,9 @@ class DKI_Importer {
                 continue;
             }
             update_post_meta($id, '_dki_image_source', $u);
+            if ($alt !== '') {
+                update_post_meta((int)$id, '_wp_attachment_image_alt', $alt);
+            }
             $attachment_ids[] = (int)$id;
         }
 

@@ -275,7 +275,16 @@ jQuery(function ($) {
       action: 'dki_save_settings',
       nonce,
       price_mode: $('#dki-price-mode').val(),
-      nofollow: $('#dki-credit-nofollow').val()
+      nofollow: $('#dki-credit-nofollow').val(),
+
+      // attribution link options
+      credit_enabled: $('#dki-credit-enabled').val(),
+      credit_text_mode: $('#dki-credit-text-mode').val(),
+      credit_text_custom: $('#dki-credit-text-custom').val(),
+
+      // image alt options
+      image_alt_mode: $('#dki-image-alt-mode').val(),
+      image_alt_custom: $('#dki-image-alt-custom').val()
     }).done(function (resp) {
       if (!resp || !resp.success) {
         $status.text(resp && resp.data && resp.data.message ? resp.data.message : 'خطا');

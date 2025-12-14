@@ -116,7 +116,6 @@ class DKI_Scraper
         if ($product_id <= 0) return new WP_Error('dki_no_id', 'شناسه محصول معتبر نیست.');
         $url = 'https://api.digikala.com/v2/product/' . $product_id . '/';
 
-
         $json = self::remote_get_json($url);
         if (is_wp_error($json)) return $json;
 

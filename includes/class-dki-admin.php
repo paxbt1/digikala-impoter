@@ -77,6 +77,15 @@ class DKI_Admin {
     public function render_page() {
         $price_mode = get_option('dki_price_mode', 'auto');
         $nofollow = get_option('dki_credit_nofollow', '1');
+
+        // Attribution (Digikala link) settings
+        $credit_enabled     = get_option('dki_credit_enabled', '1');
+        $credit_text_mode   = get_option('dki_credit_text_mode', 'default');
+        $credit_text_custom = get_option('dki_credit_text_custom', '');
+
+        // Image alt settings
+        $alt_mode           = get_option('dki_image_alt_mode', 'product');
+        $alt_fixed          = get_option('dki_image_alt_fixed', '');
         ?>
         <div class="wrap dki-metronic-wrap">
             <h1 class="dki-page-title">درج محصول از دیجی‌کالا</h1>
@@ -172,12 +181,42 @@ class DKI_Admin {
                             </div>
 
                             <div class="dki-form-field">
-                                <label>لینک اعتباردهی</label>
-                                <select id="dki-credit-nofollow" class="dki-input">
-                                    <option value="1" <?php selected($nofollow,'1'); ?>>nofollow (پیشنهادی)</option>
-                                    <option value="0" <?php selected($nofollow,'0'); ?>>follow</option>
+                                <label>درج لینک دیجی‌کالا در انتهای توضیحات</label>
+                                <select id="dki-credit-enabled" class="dki-input">
+                                    <option value="1" <?php selected($credit_enabled,'1'); ?>>فعال</option>
+                                    <option value="0" <?php selected($credit_enabled,'0'); ?>>غیرفعال</option>
                                 </select>
-                                <p class="description">لینک «مشاهده در دیجی‌کالا» انتهای توضیحات محصول اضافه می‌شود.</p>
+                                <p class="description">برای رعایت حقوق معنوی منبع می‌توانید لینک «مشاهده در دیجی‌کالا» را اضافه یا غیرفعال کنید.</p>
+                            </div>
+
+                            <div class="dki-form-field">
+                                <label>تنظیمات لینک اعتباردهی</label>
+                                <div class="dki-inline">
+                                    <select id="dki-credit-text-mode" class="dki-input">
+                                        <option value="default" <?php selected($credit_text_mode,'default'); ?>>متن پیش‌فرض (مشاهده در دیجی‌کالا)</option>
+                                        <option value="custom" <?php selected($credit_text_mode,'custom'); ?>>متن سفارشی</option>
+                                    </select>
+                                    <input type="text" id="dki-credit-text-custom" class="dki-input" placeholder="متن سفارشی لینک" value="<?php echo esc_attr($credit_text_custom); ?>">
+                                </div>
+                                <div class="dki-inline" style="margin-top:10px;">
+                                    <select id="dki-credit-nofollow" class="dki-input">
+                                        <option value="1" <?php selected($nofollow,'1'); ?>>nofollow (پیشنهادی)</option>
+                                        <option value="0" <?php selected($nofollow,'0'); ?>>follow</option>
+                                    </select>
+                                </div>
+                                <p class="description">اگر لینک فعال باشد، در انتهای توضیحات محصول اضافه می‌شود.</p>
+                            </div>
+
+                            <div class="dki-form-field">
+                                <label>آلت تصاویر محصولات</label>
+                                <div class="dki-inline">
+                                    <select id="dki-image-alt-mode" class="dki-input">
+                                        <option value="product" <?php selected($image_alt_mode,'product'); ?>>نام محصول</option>
+                                        <option value="fixed" <?php selected($image_alt_mode,'fixed'); ?>>متن ثابت/سفارشی</option>
+                                    </select>
+                                    <input type="text" id="dki-image-alt-fixed" class="dki-input" placeholder="متن آلت" value="<?php echo esc_attr($image_alt_fixed); ?>">
+                                </div>
+                                <p class="description">برای سئو داخلی بهتر، می‌توانید آلت تصاویر را نام محصول یا یک متن ثابت قرار دهید.</p>
                             </div>
                         </div>
 
@@ -214,6 +253,26 @@ class DKI_Admin {
         $nofollow = isset($_POST['nofollow']) ? sanitize_key(wp_unslash($_POST['nofollow'])) : '1';
         $nofollow = ($nofollow === '0') ? '0' : '1';
         update_option('dki_credit_nofollow', $nofollow);
+
+        // Digikala attribution link (append at end of description)
+        $credit_enabled = isset($_POST['credit_enabled']) ? sanitize_key(wp_unslash($_POST['credit_enabled'])) : '1';
+        $credit_enabled = ($credit_enabled === '0') ? '0' : '1';
+        update_option('dki_credit_enabled', $credit_enabled);
+
+        $credit_text_mode = isset($_POST['credit_text_mode']) ? sanitize_key(wp_unslash($_POST['credit_text_mode'])) : 'default';
+        $credit_text_mode = in_array($credit_text_mode, ['default','title','custom'], true) ? $credit_text_mode : 'default';
+        update_option('dki_credit_text_mode', $credit_text_mode);
+
+        $credit_text_custom = isset($_POST['credit_text_custom']) ? sanitize_text_field(wp_unslash($_POST['credit_text_custom'])) : '';
+        update_option('dki_credit_text_custom', $credit_text_custom);
+
+        // Image alt text behavior
+        $alt_mode = isset($_POST['alt_mode']) ? sanitize_key(wp_unslash($_POST['alt_mode'])) : 'product';
+        $alt_mode = in_array($alt_mode, ['product','fixed'], true) ? $alt_mode : 'product';
+        update_option('dki_image_alt_mode', $alt_mode);
+
+        $alt_fixed = isset($_POST['alt_fixed']) ? sanitize_text_field(wp_unslash($_POST['alt_fixed'])) : '';
+        update_option('dki_image_alt_fixed', $alt_fixed);
 
         wp_send_json_success(['message'=>'تنظیمات ذخیره شد.']);
     }
