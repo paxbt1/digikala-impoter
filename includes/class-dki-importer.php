@@ -3,790 +3,403 @@ if (!defined('ABSPATH')) exit;
 
 class DKI_Importer {
 
-    public static function import_product(array $dk_product): int|WP_Error {
+    public static function get_price_mode(): string {
+        $mode = get_option('dki_price_mode', 'auto'); // auto|irr|toman
+        return in_array($mode, ['auto','irr','toman'], true) ? $mode : 'auto';
+    }
 
-        if (!class_exists('WC_Product')) {
-            return new WP_Error('no_wc', 'ووکامرس فعال نیست.');
+    public static function convert_price(?int $price_irr): int {
+        if (!$price_irr) return 0;
+        $mode = self::get_price_mode();
+        $currency = function_exists('get_woocommerce_currency') ? get_woocommerce_currency() : '';
+        $is_toman_currency = in_array($currency, ['IRT', 'TMN', 'TOMAN', 'تومان'], true);
+
+        if ($mode === 'toman' || ($mode === 'auto' && $is_toman_currency)) {
+            return (int) floor($price_irr / 10);
+        }
+        // irr or auto without toman currency
+        return (int) $price_irr;
+    }
+
+    public static function ensure_attribute_pa_color() {
+        if (!function_exists('wc_get_attribute_taxonomies')) return;
+        $tax = 'pa_color';
+        $exists = taxonomy_exists($tax);
+        if ($exists) return;
+
+        // check attribute taxonomies
+        $atts = wc_get_attribute_taxonomies();
+        $has = false;
+        if (is_array($atts)) {
+            foreach ($atts as $a) {
+                if (!empty($a->attribute_name) && $a->attribute_name === 'color') { $has = true; break; }
+            }
         }
 
-        $dk_id = isset($dk_product['id']) ? (int)$dk_product['id'] : 0;
-        if ($dk_id <= 0) {
-            return new WP_Error('bad_dk_id', 'شناسه دیجی‌کالا نامعتبر است.');
+        if (!$has && function_exists('wc_create_attribute')) {
+            $id = wc_create_attribute([
+                'name'         => 'Color',
+                'slug'         => 'color',
+                'type'         => 'select',
+                'order_by'     => 'menu_order',
+                'has_archives' => false,
+            ]);
+            if (!is_wp_error($id)) {
+                delete_transient('wc_attribute_taxonomies');
+            }
         }
 
-        $title = trim((string)($dk_product['title_fa'] ?? ''));
-        if ($title === '') {
-            $title = trim((string)($dk_product['seo']['title'] ?? ''));
+        // register taxonomy immediately (Woo registers on init, but we can trigger)
+        if (!taxonomy_exists($tax)) {
+            register_taxonomy(
+                $tax,
+                apply_filters('woocommerce_taxonomy_objects_' . $tax, ['product']),
+                apply_filters('woocommerce_taxonomy_args_' . $tax, [
+                    'hierarchical' => false,
+                    'show_ui'      => false,
+                    'query_var'    => true,
+                    'rewrite'      => false,
+                ])
+            );
         }
-        if ($title === '') {
-            $title = trim((string)($dk_product['title_en'] ?? ''));
-        }
-        if ($title === '') {
-            return new WP_Error('no_title', 'عنوان محصول یافت نشد.');
+    }
+
+    public static function upsert_product_from_dk(array $dk, array $assign_cat_ids = []) {
+        if (empty($dk['title'])) return new WP_Error('dki_no_title', 'عنوان محصول یافت نشد.');
+
+        $external_id = (int)($dk['product_id'] ?? 0);
+        $source_url = (string)($dk['source_url'] ?? '');
+
+        // Dedup: use meta _dki_product_id
+        $existing_id = 0;
+        if ($external_id) {
+            $q = new WP_Query([
+                'post_type'      => 'product',
+                'posts_per_page' => 1,
+                'fields'         => 'ids',
+                'meta_key'       => '_dki_product_id',
+                'meta_value'     => $external_id,
+            ]);
+            if (!empty($q->posts[0])) $existing_id = (int)$q->posts[0];
         }
 
-        $settings = DKI_Options::get_all();
-        $post_status = ($settings['post_status'] ?? 'publish') === 'draft' ? 'draft' : 'publish';
-        $update_existing = ($settings['update_existing'] ?? 'yes') === 'yes';
-
-        $existing_id = $update_existing ? self::find_existing_product_id($dk_id) : 0;
-
-        $type = self::detect_type($dk_product);
-        $product_id = 0;
+        $post_args = [
+            'post_title'   => wp_strip_all_tags($dk['title']),
+            'post_content' => (string)($dk['description'] ?? ''),
+            'post_excerpt' => (string)($dk['short_desc'] ?? ''),
+            'post_status'  => 'publish',
+            'post_type'    => 'product',
+        ];
 
         if ($existing_id) {
-            $product_id = $existing_id;
-            $wc_product = wc_get_product($existing_id);
-            if (!$wc_product) $existing_id = 0; // fallback create new
-        }
-
-        if (!$existing_id) {
-            if ($type === 'variable') {
-                $wc_product = new WC_Product_Variable();
-            } else {
-                $wc_product = new WC_Product_Simple();
-            }
-            $wc_product->set_status($post_status);
+            $post_args['ID'] = $existing_id;
+            $product_id = wp_update_post($post_args, true);
         } else {
-            // اگر نوع تغییر کرده باشد، محصول را به نوع مناسب تبدیل کنیم
-            $wc_product = wc_get_product($existing_id);
-            if (!$wc_product) {
-                return new WP_Error('bad_existing', 'محصول موجود قابل بارگذاری نیست.');
+            $product_id = wp_insert_post($post_args, true);
+        }
+        if (is_wp_error($product_id)) return $product_id;
+
+        // Save source meta
+        if ($external_id) update_post_meta($product_id, '_dki_product_id', $external_id);
+        if ($source_url) update_post_meta($product_id, '_dki_source_url', esc_url_raw($source_url));
+        if (!empty($dk['specs_html'])) update_post_meta($product_id, '_dki_specs_html', wp_kses_post($dk['specs_html']));
+
+        // Determine variable vs simple: if variants include multiple colors
+        $variants = $dk['variants'] ?? [];
+        $colors_map = self::extract_colors_from_variants($variants);
+
+        $is_variable = (count($colors_map) >= 1); // if at least 1 color variant exists, create variable (single attribute)
+        // Some products might be truly simple with no color in variants -> simple.
+        if (count($colors_map) === 0) $is_variable = false;
+
+        if ($is_variable) {
+            self::ensure_attribute_pa_color();
+            wp_set_object_terms($product_id, 'variable', 'product_type');
+
+            // assign categories if provided
+            if (!empty($assign_cat_ids)) {
+                wp_set_object_terms($product_id, array_map('intval', $assign_cat_ids), 'product_cat', false);
             }
-            $current_type = $wc_product->get_type();
-            if ($type === 'variable' && $current_type !== 'variable') {
-                wp_set_object_terms($existing_id, 'variable', 'product_type');
-                $wc_product = new WC_Product_Variable($existing_id);
-            } elseif ($type === 'simple' && $current_type !== 'simple') {
-                wp_set_object_terms($existing_id, 'simple', 'product_type');
-                $wc_product = new WC_Product_Simple($existing_id);
+
+            $color_terms = [];
+            foreach ($colors_map as $color_name => $payload) {
+                $term = term_exists($color_name, 'pa_color');
+                if (!$term) {
+                    $term = wp_insert_term($color_name, 'pa_color');
+                }
+                if (!is_wp_error($term) && !empty($term['term_id'])) {
+                    $color_terms[] = (int)$term['term_id'];
+                }
             }
-            $wc_product->set_status($post_status);
+            if ($color_terms) {
+                wp_set_object_terms($product_id, $color_terms, 'pa_color', false);
+            }
+
+            // product attributes meta
+            $attrs = [
+                'pa_color' => [
+                    'name'         => 'pa_color',
+                    'value'        => '',
+                    'position'     => 0,
+                    'is_visible'   => 1,
+                    'is_variation' => 1,
+                    'is_taxonomy'  => 1,
+                ],
+            ];
+            update_post_meta($product_id, '_product_attributes', $attrs);
+
+            // build variations: ONE per color (minimum price variant in that color)
+            $variation_ids = self::sync_color_variations($product_id, $colors_map);
+
+            // choose default as min-price color
+            $min_color = '';
+            $min_price = null;
+            foreach ($colors_map as $color_name => $payload) {
+                $p = $payload['price'] ?? null;
+                if ($p === null) continue;
+                if ($min_price === null or $p < $min_price) {
+                    $min_price = $p;
+                    $min_color = $color_name;
+                }
+            }
+            if ($min_color !== '') {
+                update_post_meta($product_id, '_default_attributes', ['pa_color' => sanitize_title($min_color)]);
+            }
+
+            // set parent stock status based on any instock variation
+            $parent_stock = 'outofstock';
+            foreach ($colors_map as $payload) {
+                if (($payload['stock_status'] ?? '') === 'instock') { $parent_stock = 'instock'; break; }
+            }
+            wc_update_product_stock_status($product_id, $parent_stock);
+
+            // set price range by Woo automatically from variations; but ensure parent _price is min
+            if ($min_price !== null) {
+                update_post_meta($product_id, '_price', (string)$min_price);
+            }
+
+        } else {
+            wp_set_object_terms($product_id, 'simple', 'product_type');
+
+            if (!empty($assign_cat_ids)) {
+                wp_set_object_terms($product_id, array_map('intval', $assign_cat_ids), 'product_cat', false);
+            }
+
+            $price = isset($dk['price']) ? self::convert_price((int)$dk['price']) : 0;
+            update_post_meta($product_id, '_regular_price', (string)$price);
+            update_post_meta($product_id, '_price', (string)$price);
+
+            $stock = (string)($dk['stock_status'] ?? 'outofstock');
+            wc_update_product_stock_status($product_id, $stock);
         }
 
-        // عنوان و محتوا
-        $wc_product->set_name($title);
-
-        $description = self::build_description($dk_product);
-        $short_desc  = self::build_short_description($dk_product);
-
-        $wc_product->set_description($description);
-        $wc_product->set_short_description($short_desc);
-
-        // متاها
-        $wc_product->update_meta_data('_dki_product_id', $dk_id);
-        $source_url = '';
-        if (!empty($dk_product['url']['uri'])) {
-            $source_url = 'https://www.digikala.com' . $dk_product['url']['uri'];
+        // Attributes (global product attributes - create WC attributes if needed)
+        if (!empty($dk['attributes']) && is_array($dk['attributes'])) {
+            self::apply_global_attributes($product_id, $dk['attributes']);
         }
+
+        // Images: set featured + gallery
+        if (!empty($dk['images']) && is_array($dk['images'])) {
+            self::set_images($product_id, $dk['images'], $dk['title'] ?? '');
+        }
+
+        // Append credit link to digikala (SEO-safe: normal link, optional nofollow via option)
         if ($source_url) {
-            $wc_product->update_meta_data('_dki_source_url', esc_url_raw($source_url));
-        }
-        if (!empty($dk_product['brand']['title_fa'])) {
-            $wc_product->update_meta_data('_dki_brand', sanitize_text_field($dk_product['brand']['title_fa']));
-        }
-        if (!empty($dk_product['category']['title_fa'])) {
-            $wc_product->update_meta_data('_dki_category', sanitize_text_field($dk_product['category']['title_fa']));
+            self::append_credit_link($product_id, $source_url);
         }
 
-        // قیمت/موجودی
-        if ($type === 'simple') {
-            $price_info = self::extract_best_price($dk_product);
-            $regular_rial = (int)($price_info['regular'] ?? 0);
-            $sale_rial    = (int)($price_info['sale'] ?? 0);
-
-            $regular = DKI_Options::price_to_store_unit($regular_rial);
-            $sale    = DKI_Options::price_to_store_unit($sale_rial);
-
-            if ($regular > 0) {
-                $wc_product->set_regular_price((string)$regular);
-                if ($sale > 0 && $sale < $regular) {
-                    $wc_product->set_sale_price((string)$sale);
-                } else {
-                    $wc_product->set_sale_price('');
-                }
-            } else {
-                $wc_product->set_regular_price('');
-                $wc_product->set_sale_price('');
-            }
-
-            $stock_status = self::extract_stock_status($dk_product);
-            $wc_product->set_stock_status($stock_status);
-        } else {
-            // variable: prices on variations
-            $wc_product->set_regular_price('');
-            $wc_product->set_sale_price('');
-        }
-
-        // ذخیره اولیه برای گرفتن ID
-        $product_id = $wc_product->save();
-
-        if (!$product_id) {
-            return new WP_Error('save_failed', 'ذخیره محصول ناموفق بود.');
-        }
-
-        // تصاویر
-        self::sync_images($product_id, $dk_product);
-
-        // ویژگی‌ها
-        self::sync_attributes($product_id, $dk_product, $type);
-
-        // واریانت‌ها
-        if ($type === 'variable') {
-            $res = self::sync_variations($product_id, $dk_product);
-            if (is_wp_error($res)) {
-                return $res;
-            }
-        } else {
-            // پاکسازی وارییشن‌های احتمالی قدیمی
-            self::delete_all_variations($product_id);
-        }
-
-        // ذخیره نهایی
-        $wc_product = wc_get_product($product_id);
-        if ($wc_product) {
-            $wc_product->save();
-        }
-
-        return $product_id;
+        return (int)$product_id;
     }
 
-    private static function find_existing_product_id(int $dk_id): int {
-        $q = new WP_Query([
-            'post_type'      => 'product',
-            'post_status'    => ['publish','draft','pending','private'],
-            'fields'         => 'ids',
-            'posts_per_page' => 1,
-            'meta_query'     => [
-                [
-                    'key'   => '_dki_product_id',
-                    'value' => (string)$dk_id,
-                    'compare' => '='
-                ]
-            ],
+    private static function append_credit_link(int $product_id, string $source_url): void {
+        $nofollow = get_option('dki_credit_nofollow', '1') === '1';
+        $anchor = 'مشاهده در دیجی‌کالا';
+        $rel = $nofollow ? 'nofollow noopener' : 'noopener';
+        $html = '<p class="dki-credit"><a href="' . esc_url($source_url) . '" target="_blank" rel="' . esc_attr($rel) . '">' . esc_html($anchor) . '</a></p>';
+
+        $post = get_post($product_id);
+        if (!$post) return;
+
+        // Avoid duplicate append
+        if (strpos($post->post_content, 'class="dki-credit"') !== false) return;
+
+        $new = $post->post_content . "\n\n" . $html;
+        wp_update_post([
+            'ID' => $product_id,
+            'post_content' => $new,
         ]);
-        if (!empty($q->posts[0])) return (int)$q->posts[0];
-        return 0;
     }
 
-    private static function detect_type(array $p): string {
-        $variants = $p['variants'] ?? [];
-        if (!is_array($variants) || count($variants) < 2) {
-            return 'simple';
-        }
-        // اگر حداقل ۲ واریانت و حداقل یک ویژگی متفاوت داشتیم => variable
-        $first = $variants[0] ?? [];
-        $attrs = self::variant_attributes_map($first);
-        if (empty($attrs)) return 'simple';
+    private static function extract_colors_from_variants(array $variants): array {
+        $colors = [];
+        foreach ($variants as $v) {
+            if (!is_array($v)) continue;
+            $color = $v['color'] ?? null;
+            if (!is_array($color)) continue;
+            $name = trim((string)($color['title'] ?? $color['title_fa'] ?? ''));
+            if ($name === '') continue;
 
-        // بررسی اختلاف
-        foreach (array_slice($variants, 1, 5) as $v) {
-            $m = self::variant_attributes_map($v);
-            if ($m != $attrs) return 'variable';
-        }
-        // اگر تعداد زیاد است ولی یکسان، همچنان simple
-        return 'simple';
-    }
+            $price_irr = $v['price']['selling_price'] ?? null;
+            $price = $price_irr !== null ? self::convert_price((int)$price_irr) : null;
 
-    private static function extract_stock_status(array $p): string {
-        $status = (string)($p['status'] ?? '');
-        if ($status === 'in_stock') return 'instock';
-        if ($status === 'out_of_stock') return 'outofstock';
+            $stock = 'outofstock';
+            $st = (string)($v['status'] ?? '');
+            $av = (string)($v['availability']['status'] ?? '');
+            if ($st === 'marketable' || $av === 'in_stock' || $av === 'available') $stock = 'instock';
 
-        // fallback: اگر قیمت از واریانت‌ها هست
-        $variants = $p['variants'] ?? [];
-        if (is_array($variants)) {
-            foreach ($variants as $v) {
-                $st = (string)($v['status'] ?? '');
-                if ($st === 'in_stock') return 'instock';
-            }
-        }
-        return 'outofstock';
-    }
-
-    private static function extract_best_price(array $p): array {
-        // برگشتی: ['regular'=>IRR, 'sale'=>IRR]
-        $regular = 0; $sale = 0;
-
-        // اول default_variant
-        $dv = $p['default_variant'] ?? null;
-        if (is_array($dv)) {
-            $price = $dv['price'] ?? [];
-            if (is_array($price)) {
-                $sale = (int)($price['selling_price'] ?? 0);
-                $regular = (int)($price['rrp_price'] ?? 0);
-                if (!$regular) $regular = (int)($price['selling_price'] ?? 0);
-            }
-        }
-
-        // اگر خالی بود، از واریانت‌ها مینیمم را بگیر
-        if ($sale <= 0) {
-            $variants = $p['variants'] ?? [];
-            if (is_array($variants)) {
-                $min_sale = 0; $min_reg = 0;
-                foreach ($variants as $v) {
-                    $price = $v['price'] ?? [];
-                    if (!is_array($price)) continue;
-                    $sv = (int)($price['selling_price'] ?? 0);
-                    $rg = (int)($price['rrp_price'] ?? 0);
-                    if ($sv > 0 && ($min_sale === 0 || $sv < $min_sale)) $min_sale = $sv;
-                    if ($rg > 0 && ($min_reg === 0 || $rg < $min_reg)) $min_reg = $rg;
+            // Keep the minimum priced variant per color
+            if (!isset($colors[$name])) {
+                $colors[$name] = ['price' => $price, 'stock_status' => $stock];
+            } else {
+                if ($price !== null) {
+                    $prev = $colors[$name]['price'];
+                    if ($prev === null || $price < $prev) $colors[$name]['price'] = $price;
                 }
-                $sale = $min_sale;
-                $regular = $min_reg ?: $min_sale;
+                if ($stock === 'instock') $colors[$name]['stock_status'] = 'instock';
             }
         }
-
-        return [
-            'regular' => max(0, $regular),
-            'sale'    => max(0, $sale),
-        ];
+        return $colors;
     }
 
-    private static function build_short_description(array $p): string {
-        $sr = (string)($p['expert_reviews']['short_review'] ?? '');
-        $sr = trim(wp_strip_all_tags($sr));
-        if ($sr) return wp_trim_words($sr, 45, '...');
-        $seo = (string)($p['seo']['description'] ?? '');
-        $seo = trim(wp_strip_all_tags($seo));
-        if ($seo) return wp_trim_words($seo, 45, '...');
-        return '';
-    }
+    private static function sync_color_variations(int $product_id, array $colors_map): array {
+        $created = [];
 
-    private static function build_description(array $p): string {
-        $parts = [];
-
-        // معرفی کوتاه / expert description
-        $desc = (string)($p['expert_reviews']['description'] ?? '');
-        if (trim($desc) !== '') {
-            $parts[] = '<h2>بررسی تخصصی</h2>' . wp_kses_post($desc);
+        // existing variations by attribute value
+        $existing = [];
+        $children = get_posts([
+            'post_parent' => $product_id,
+            'post_type'   => 'product_variation',
+            'numberposts' => -1,
+            'post_status' => ['publish','private'],
+            'fields'      => 'ids',
+        ]);
+        foreach ($children as $vid) {
+            $val = get_post_meta($vid, 'attribute_pa_color', true);
+            if ($val) $existing[$val] = (int)$vid;
         }
 
-        // بخش‌های بررسی تخصصی
-        $sections = $p['expert_reviews']['review_sections'] ?? [];
-        if (is_array($sections) && !empty($sections)) {
-            foreach ($sections as $sec) {
-                $t = trim((string)($sec['title'] ?? ''));
-                $c = (string)($sec['content'] ?? '');
-                if ($t && trim(wp_strip_all_tags($c)) !== '') {
-                    $parts[] = '<h3>' . esc_html($t) . '</h3>' . wp_kses_post($c);
-                }
-            }
-        }
+        foreach ($colors_map as $color_name => $payload) {
+            $slug = sanitize_title($color_name);
+            $vid = $existing[$slug] ?? 0;
 
-        // مشخصات (table)
-        $specs = $p['specifications'] ?? [];
-        if (is_array($specs) && !empty($specs)) {
-            $parts[] = '<h2>مشخصات</h2>' . self::specs_to_html_table($specs);
-        }
-
-        // ویژگی‌های برجسته (review.attributes)
-        $high = $p['review']['attributes'] ?? [];
-        if (is_array($high) && !empty($high)) {
-            $parts[] = '<h2>ویژگی‌های برجسته</h2>' . self::review_attrs_to_ul($high);
-        }
-
-        // اطلاعات SEO
-        $seo_desc = (string)($p['seo']['description'] ?? '');
-        if (trim($seo_desc) !== '') {
-            $parts[] = '<h2>توضیحات</h2><p>' . esc_html($seo_desc) . '</p>';
-        }
-
-        $out = implode("\n", $parts);
-        if ($out === '') {
-            $out = '';
-        }
-
-        // لینک منبع
-        if (!empty($p['url']['uri'])) {
-            $out .= "\n<hr>\n<p><a href=\"" . esc_url('https://www.digikala.com' . $p['url']['uri']) . "\" target=\"_blank\" rel=\"noopener\">مشاهده در دیجی‌کالا</a></p>";
-        }
-
-        return $out;
-    }
-
-    private static function specs_to_html_table(array $specs): string {
-        $html = '<div class="dki-specs"><table class="shop_attributes"><tbody>';
-        foreach ($specs as $group) {
-            $group_title = trim((string)($group['title'] ?? ''));
-            $attrs = $group['attributes'] ?? [];
-            if (!is_array($attrs) || empty($attrs)) continue;
-
-            if ($group_title) {
-                $html .= '<tr><th colspan="2" style="text-align:right;">' . esc_html($group_title) . '</th></tr>';
+            if (!$vid) {
+                $vid = wp_insert_post([
+                    'post_title'  => 'Variation: ' . $color_name,
+                    'post_name'   => 'product-' . $product_id . '-variation-' . $slug,
+                    'post_status' => 'publish',
+                    'post_parent' => $product_id,
+                    'post_type'   => 'product_variation',
+                    'menu_order'  => 0,
+                ], true);
+                if (is_wp_error($vid)) continue;
             }
 
-            foreach ($attrs as $a) {
-                $t = trim((string)($a['title'] ?? ''));
-                $vals = $a['values'] ?? [];
-                if (!is_array($vals)) $vals = [];
-                $v = implode('، ', array_map('sanitize_text_field', $vals));
-                if ($t === '' || $v === '') continue;
+            update_post_meta($vid, 'attribute_pa_color', $slug);
 
-                $html .= '<tr><th>' . esc_html($t) . '</th><td>' . esc_html($v) . '</td></tr>';
+            $price = $payload['price'] ?? null;
+            if ($price !== null) {
+                update_post_meta($vid, '_regular_price', (string)$price);
+                update_post_meta($vid, '_price', (string)$price);
             }
+
+            $stock = (string)($payload['stock_status'] ?? 'outofstock');
+            wc_update_product_stock_status($vid, $stock);
+
+            $created[] = (int)$vid;
         }
-        $html .= '</tbody></table></div>';
-        return $html;
+
+        return $created;
     }
 
-    private static function review_attrs_to_ul(array $attrs): string {
-        $html = '<ul class="dki-highlights">';
-        foreach ($attrs as $a) {
-            $t = trim((string)($a['title'] ?? ''));
-            $vals = $a['values'] ?? [];
-            if (!is_array($vals)) $vals = [];
-            $v = implode('، ', array_map('sanitize_text_field', $vals));
-            if ($t === '' || $v === '') continue;
-            $html .= '<li><strong>' . esc_html($t) . ':</strong> ' . esc_html($v) . '</li>';
+    private static function apply_global_attributes(int $product_id, array $attributes): void {
+        // Create WC product attributes (global) if needed; assign per-product in _product_attributes too.
+        // IMPORTANT: keep existing product attributes if any; merge.
+        $existing = get_post_meta($product_id, '_product_attributes', true);
+        if (!is_array($existing)) $existing = [];
+
+        $pos = 1;
+        foreach ($attributes as $name => $values) {
+            $name = trim((string)$name);
+            if ($name === '') continue;
+            if (!is_array($values)) $values = [$values];
+            $values = array_values(array_filter(array_map(function($v){ return trim((string)$v); }, $values)));
+            if (!$values) continue;
+
+            // Use custom (local) attribute (non-taxonomy) so we don't pollute global list too much,
+            // but also add to visible attributes.
+            // If user wants global, they can migrate later.
+            $key = sanitize_title($name);
+            $meta_key = $key;
+
+            // avoid collision with pa_color
+            if ($meta_key === 'pa_color' || $meta_key === 'color') $meta_key = 'dki_' . $meta_key;
+
+            $existing[$meta_key] = [
+                'name'         => $name,
+                'value'        => implode(' | ', $values),
+                'position'     => $pos++,
+                'is_visible'   => 1,
+                'is_variation' => 0,
+                'is_taxonomy'  => 0,
+            ];
         }
-        $html .= '</ul>';
-        return $html;
+
+        update_post_meta($product_id, '_product_attributes', $existing);
     }
 
-    private static function sync_images(int $product_id, array $p): void {
-        $limit = (int) DKI_Options::get('image_limit', 12);
-        $limit = max(1, min(30, $limit));
-
-        $images = [];
-
-        // main image
-        if (!empty($p['images']['main']['url'][0])) {
-            $images[] = $p['images']['main']['url'][0];
-        } elseif (!empty($p['variants_images']['main']['url'][0])) {
-            $images[] = $p['variants_images']['main']['url'][0];
-        }
-
-        // gallery list
-        $list = $p['images']['list'] ?? [];
-        if (is_array($list)) {
-            foreach ($list as $img) {
-                if (!empty($img['url'][0])) $images[] = $img['url'][0];
-                if (count($images) >= $limit) break;
-            }
-        }
-
-        // unique
-        $images = array_values(array_unique(array_filter($images)));
-
-        if (empty($images)) return;
-
-        $featured_id = 0;
-        $gallery_ids = [];
-
-        foreach ($images as $idx => $url) {
-            $att_id = self::sideload_image_to_media($url, $product_id, 'Digikala Image');
-            if (is_wp_error($att_id)) continue;
-
-            if ($idx === 0) $featured_id = (int)$att_id;
-            else $gallery_ids[] = (int)$att_id;
-        }
-
-        if ($featured_id) {
-            set_post_thumbnail($product_id, $featured_id);
-        }
-
-        if (!empty($gallery_ids)) {
-            update_post_meta($product_id, '_product_image_gallery', implode(',', $gallery_ids));
-        }
-    }
-
-    private static function sideload_image_to_media(string $url, int $post_id, string $desc = ''): int|WP_Error {
-        if (!function_exists('download_url')) {
-            require_once ABSPATH . 'wp-admin/includes/file.php';
-        }
+    private static function set_images(int $product_id, array $urls, string $desc = ''): void {
         if (!function_exists('media_handle_sideload')) {
             require_once ABSPATH . 'wp-admin/includes/media.php';
+            require_once ABSPATH . 'wp-admin/includes/file.php';
             require_once ABSPATH . 'wp-admin/includes/image.php';
         }
 
-        $url = esc_url_raw($url);
-        if (!$url) return new WP_Error('bad_image_url', 'URL تصویر نامعتبر است.');
+        $attachment_ids = [];
+        foreach ($urls as $u) {
+            $u = esc_url_raw($u);
+            if (!$u) continue;
 
-        // فایل نام بهتر
-        $path = parse_url($url, PHP_URL_PATH);
-        $name = $path ? basename($path) : ('dki-' . time() . '.jpg');
-
-        $tmp = download_url($url, (int) DKI_Options::get('timeout', 25));
-        if (is_wp_error($tmp)) {
-            return $tmp;
-        }
-
-        $file_array = [
-            'name'     => sanitize_file_name($name),
-            'tmp_name' => $tmp,
-        ];
-
-        $id = media_handle_sideload($file_array, $post_id, $desc);
-
-        if (is_wp_error($id)) {
-            @unlink($tmp);
-            return $id;
-        }
-
-        return (int)$id;
-    }
-
-    private static function sync_attributes(int $product_id, array $p, string $type): void {
-
-        $create_global = (DKI_Options::get('create_global_attributes', 'yes') === 'yes');
-
-        // جمع‌آوری ویژگی‌ها از specifications + review.attributes
-        $attrs_map = [];
-
-        $specs = $p['specifications'] ?? [];
-        if (is_array($specs)) {
-            foreach ($specs as $group) {
-                $attrs = $group['attributes'] ?? [];
-                if (!is_array($attrs)) continue;
-                foreach ($attrs as $a) {
-                    $t = trim((string)($a['title'] ?? ''));
-                    $vals = $a['values'] ?? [];
-                    if (!is_array($vals)) $vals = [];
-                    $vals = array_values(array_filter(array_map('sanitize_text_field', $vals)));
-                    if ($t && !empty($vals)) {
-                        $attrs_map[$t] = array_values(array_unique(array_merge($attrs_map[$t] ?? [], $vals)));
-                    }
-                }
-            }
-        }
-
-        $high = $p['review']['attributes'] ?? [];
-        if (is_array($high)) {
-            foreach ($high as $a) {
-                $t = trim((string)($a['title'] ?? ''));
-                $vals = $a['values'] ?? [];
-                if (!is_array($vals)) $vals = [];
-                $vals = array_values(array_filter(array_map('sanitize_text_field', $vals)));
-                if ($t && !empty($vals)) {
-                    $attrs_map[$t] = array_values(array_unique(array_merge($attrs_map[$t] ?? [], $vals)));
-                }
-            }
-        }
-
-        // اگر variable باشد، ویژگی‌های واریانت را هم اضافه کن (و is_variation)
-        $variation_attrs = [];
-        if ($type === 'variable') {
-            $variants = $p['variants'] ?? [];
-            if (is_array($variants)) {
-                foreach ($variants as $v) {
-                    $vm = self::variant_attributes_map($v);
-                    foreach ($vm as $k => $vval) {
-                        if (!$k || !$vval) continue;
-                        $variation_attrs[$k] = array_values(array_unique(array_merge($variation_attrs[$k] ?? [], [$vval])));
-                        $attrs_map[$k] = array_values(array_unique(array_merge($attrs_map[$k] ?? [], [$vval])));
-                    }
-                }
-            }
-        }
-
-        $wc_product = wc_get_product($product_id);
-        if (!$wc_product) return;
-
-        $product_attributes = [];
-
-        foreach ($attrs_map as $label => $values) {
-            if (empty($values)) continue;
-
-            $is_variation = isset($variation_attrs[$label]);
-            $taxonomy = '';
-
-            if ($create_global) {
-                $taxonomy = self::ensure_global_attribute_taxonomy($label);
-            }
-
-            $attr_obj = new WC_Product_Attribute();
-
-            if ($taxonomy) {
-                $attr_id = wc_attribute_taxonomy_id_by_name(substr($taxonomy, 3)); // remove pa_
-                $attr_obj->set_id((int)$attr_id);
-                $attr_obj->set_name($taxonomy);
-
-                // terms
-                $term_ids = [];
-                foreach ($values as $val) {
-                    $term = term_exists($val, $taxonomy);
-                    if (!$term) {
-                        $term = wp_insert_term($val, $taxonomy);
-                    }
-                    if (!is_wp_error($term) && !empty($term['term_id'])) {
-                        $term_ids[] = (int)$term['term_id'];
-                    }
-                }
-                $attr_obj->set_options($term_ids);
-            } else {
-                // local attribute
-                $attr_obj->set_name($label);
-                $attr_obj->set_options($values);
-            }
-
-            $attr_obj->set_position(0);
-            $attr_obj->set_visible(true);
-            $attr_obj->set_variation($is_variation);
-
-            $product_attributes[] = $attr_obj;
-        }
-
-        $wc_product->set_attributes($product_attributes);
-        $wc_product->save();
-    }
-
-    private static function label_to_attr_slug(string $label): string {
-        // IMPORTANT: This function must be pure and MUST NOT call itself.
-        // We intentionally use sanitize_title (not sanitize_key) to support
-        // non‑Latin labels as best as WP can, with a safe hash fallback.
-        $label = trim($label);
-
-        $slug = sanitize_title($label);
-        if ($slug === '') {
-            $slug = 'attr-' . substr(md5($label), 0, 12);
-        }
-
-        // WC attribute taxonomy name (pa_{slug}) has limits; keep it short.
-        return substr($slug, 0, 28);
-    }
-
-    private static function register_attribute_taxonomy_if_needed(string $taxonomy, string $label): void {
-        if (taxonomy_exists($taxonomy)) return;
-
-        // رجیستر موقت تا بتوانیم term بسازیم (در همین درخواست AJAX)
-        register_taxonomy($taxonomy, ['product'], [
-            'hierarchical' => true,
-            'show_ui'      => false,
-            'query_var'    => true,
-            'rewrite'      => false,
-            'public'       => false,
-            'labels'       => [
-                'name' => $label,
-            ],
-        ]);
-    }
-
-    private static function ensure_global_attribute_taxonomy(string $label): string {
-        if (!function_exists('wc_create_attribute')) {
-            return '';
-        }
-        $label = trim($label);
-        if ($label === '') return '';
-
-        $slug = self::label_to_attr_slug($label);
-        $taxonomy = wc_attribute_taxonomy_name($slug); // pa_{slug}
-
-        // اگر attribute در DB هست ولی taxonomy هنوز register نشده (در همین درخواست)
-        $exists_id = wc_attribute_taxonomy_id_by_name($slug);
-        if ($exists_id && !taxonomy_exists($taxonomy)) {
-            self::register_attribute_taxonomy_if_needed($taxonomy, $label);
-            return $taxonomy;
-        }
-
-        // اگر taxonomy وجود دارد، تمام
-        if (taxonomy_exists($taxonomy)) {
-            return $taxonomy;
-        }
-
-        // ایجاد attribute
-        $attr_id = wc_create_attribute([
-            'name'         => $label,
-            'slug'         => $slug,
-            'type'         => 'select',
-            'order_by'     => 'menu_order',
-            'has_archives' => false,
-        ]);
-
-        if (is_wp_error($attr_id)) {
-            return '';
-        }
-
-        delete_transient('wc_attribute_taxonomies');
-
-        // رجیستر موقت taxonomy برای ساخت term در همین درخواست
-        self::register_attribute_taxonomy_if_needed($taxonomy, $label);
-
-        return $taxonomy;
-    }
-
-    private static function variant_attributes_map(array $variant): array {
-        // map label => single value string (join)
-        $out = [];
-
-        $attrs = $variant['attributes'] ?? null;
-        if (is_array($attrs)) {
-            foreach ($attrs as $a) {
-                $t = trim((string)($a['title'] ?? ''));
-                $vals = $a['values'] ?? [];
-                if (!is_array($vals)) $vals = [];
-                $v = implode('، ', array_values(array_filter(array_map('sanitize_text_field', $vals))));
-                if ($t && $v) $out[$t] = $v;
-            }
-        }
-
-        // بعضی ساختارها ممکن است این‌طور باشند: ['variant_options'=>[...]]
-        if (empty($out) && !empty($variant['variant_options']) && is_array($variant['variant_options'])) {
-            foreach ($variant['variant_options'] as $a) {
-                $t = trim((string)($a['title'] ?? ''));
-                $v = trim((string)($a['value'] ?? ''));
-                if ($t && $v) $out[$t] = sanitize_text_field($v);
-            }
-        }
-
-        // رنگ
-        if (empty($out) && !empty($variant['color']['title'])) {
-            $out['رنگ'] = sanitize_text_field($variant['color']['title']);
-        }
-
-        return $out;
-    }
-
-    private static function sync_variations(int $product_id, array $p): bool|WP_Error {
-        $wc_product = wc_get_product($product_id);
-        if (!$wc_product || $wc_product->get_type() !== 'variable') {
-            return new WP_Error('not_variable', 'محصول Variable نیست.');
-        }
-
-        $variants = $p['variants'] ?? [];
-        if (!is_array($variants) || empty($variants)) {
-            return new WP_Error('no_variants', 'واریانت‌ها در پاسخ دیجی‌کالا یافت نشد.');
-        }
-
-        // پاکسازی وارییشن‌های قبلی (برای sync درست)
-        self::delete_all_variations($product_id);
-
-        // attributes موجود روی محصول را بخوان
-        $prod_attrs = $wc_product->get_attributes();
-        $tax_to_label = [];
-        foreach ($prod_attrs as $attr) {
-            if ($attr instanceof WC_Product_Attribute) {
-                $name = $attr->get_name();
-                if (is_string($name) && strpos($name, 'pa_') === 0) {
-                    $tax_to_label[$name] = $name;
-                }
-            }
-        }
-
-        $created = 0;
-
-        foreach ($variants as $v) {
-            $vmap = self::variant_attributes_map($v);
-            if (empty($vmap)) {
-                // اگر ساختار واریانت ناقص است، رد کن
+            // try to dedupe by meta _dki_image_source
+            $existing = self::find_attachment_by_source($u);
+            if ($existing) {
+                $attachment_ids[] = $existing;
                 continue;
             }
 
-            $variation = new WC_Product_Variation();
-            $variation->set_parent_id($product_id);
+            $tmp = download_url($u, 30);
+            if (is_wp_error($tmp)) continue;
 
-            // price
-            $price = $v['price'] ?? [];
-            $sale_rial = is_array($price) ? (int)($price['selling_price'] ?? 0) : 0;
-            $reg_rial  = is_array($price) ? (int)($price['rrp_price'] ?? 0) : 0;
-            if (!$reg_rial) $reg_rial = $sale_rial;
-
-            $sale = DKI_Options::price_to_store_unit($sale_rial);
-            $reg  = DKI_Options::price_to_store_unit($reg_rial);
-
-            if ($reg > 0) {
-                $variation->set_regular_price((string)$reg);
-                if ($sale > 0 && $sale < $reg) $variation->set_sale_price((string)$sale);
+            $file_array = [
+                'name'     => basename(parse_url($u, PHP_URL_PATH)),
+                'tmp_name' => $tmp,
+            ];
+            $id = media_handle_sideload($file_array, $product_id, $desc);
+            if (is_wp_error($id)) {
+                @unlink($tmp);
+                continue;
             }
-
-            // stock
-            $st = (string)($v['status'] ?? '');
-            if ($st === 'in_stock') $variation->set_stock_status('instock');
-            elseif ($st === 'out_of_stock') $variation->set_stock_status('outofstock');
-            else $variation->set_stock_status('instock');
-
-            // sku
-            $vid = (int)($v['id'] ?? ($v['variant_id'] ?? 0));
-            $variation->set_sku('DKI-' . $product_id . '-' . ($vid ?: $created+1));
-
-            // attributes for variation (must be taxonomy key => term slug)
-            $attrs_for_var = [];
-
-            foreach ($vmap as $label => $val) {
-                // پیدا کردن taxonomy از روی label در attributes محصول
-                $taxonomy = self::guess_taxonomy_for_label($wc_product, $label);
-                if ($taxonomy && taxonomy_exists($taxonomy)) {
-                    $term = term_exists($val, $taxonomy);
-                    if (!$term) $term = wp_insert_term($val, $taxonomy);
-                    if (!is_wp_error($term)) {
-                        $term_obj = get_term_by('id', (int)$term['term_id'], $taxonomy);
-                        if ($term_obj) {
-                            $attrs_for_var[$taxonomy] = $term_obj->slug;
-                        }
-                    }
-                } else {
-                    // local attribute
-                    $attrs_for_var[sanitize_title($label)] = $val;
-                }
-            }
-
-            if (empty($attrs_for_var)) continue;
-
-            $variation->set_attributes($attrs_for_var);
-
-            // variation image
-            $img_url = '';
-            if (!empty($v['images']['main']['url'][0])) {
-                $img_url = $v['images']['main']['url'][0];
-            }
-            if ($img_url) {
-                $att_id = self::sideload_image_to_media($img_url, $product_id, 'Variation Image');
-                if (!is_wp_error($att_id)) {
-                    $variation->set_image_id((int)$att_id);
-                }
-            }
-
-            $variation_id = $variation->save();
-            if ($variation_id) $created++;
+            update_post_meta($id, '_dki_image_source', $u);
+            $attachment_ids[] = (int)$id;
         }
 
-        if ($created <= 0) {
-            return new WP_Error('no_variations_created', 'هیچ وارییشنی ساخته نشد. ساختار واریانت‌های دیجی‌کالا ممکن است متفاوت باشد.');
+        $attachment_ids = array_values(array_unique(array_filter($attachment_ids)));
+        if (!$attachment_ids) return;
+
+        set_post_thumbnail($product_id, $attachment_ids[0]);
+
+        if (count($attachment_ids) > 1) {
+            update_post_meta($product_id, '_product_image_gallery', implode(',', array_slice($attachment_ids, 1)));
         }
-
-        // sync variable product price range
-        $wc_product->save();
-
-        return true;
     }
 
-    private static function guess_taxonomy_for_label(WC_Product $wc_product, string $label): string {
-        $attrs = $wc_product->get_attributes();
-        foreach ($attrs as $attr) {
-            if (!($attr instanceof WC_Product_Attribute)) continue;
-            $name = $attr->get_name();
-            if (is_string($name) && strpos($name, 'pa_') === 0) {
-                $id = $attr->get_id();
-                // نام attribute در DB
-                $tax = $name;
-                // عنوان را مستقیماً نداریم؛ پس ساده‌ترین: اگر term با val وارد شده، tax درست است.
-                // ولی برای انتخاب tax بر اساس label، اینجا fallback می‌زنیم:
-                // اگر slug label داخل tax باشد.
-                $slug = self::label_to_attr_slug($label);
-                if ($slug && strpos($tax, 'pa_' . $slug) === 0) {
-                    return $tax;
-                }
-            }
-        }
-        // fallback: تلاش برای tax از label
-        $slug = self::label_to_attr_slug($label);
-        if ($slug) {
-            $tax = wc_attribute_taxonomy_name($slug);
-            return $tax;
-        }
-        return '';
-    }
-
-    private static function delete_all_variations(int $product_id): void {
-        $children = get_posts([
-            'post_type'      => 'product_variation',
-            'post_parent'    => $product_id,
-            'post_status'    => 'any',
-            'numberposts'    => -1,
+    private static function find_attachment_by_source(string $url): int {
+        $q = new WP_Query([
+            'post_type'      => 'attachment',
+            'posts_per_page' => 1,
             'fields'         => 'ids',
+            'meta_key'       => '_dki_image_source',
+            'meta_value'     => $url,
         ]);
-        foreach ($children as $cid) {
-            wp_delete_post((int)$cid, true);
-        }
+        return !empty($q->posts[0]) ? (int)$q->posts[0] : 0;
     }
 }

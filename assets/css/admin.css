@@ -1,0 +1,35 @@
+/* Minimal Metronic-ish look */
+.dki-metronic-wrap{direction:rtl}
+.dki-page-title{margin:16px 0 12px;font-size:20px}
+.dki-tabs{display:flex;gap:8px;margin:10px 0 14px;flex-wrap:wrap}
+.dki-tab{border:1px solid #d0d5dd;background:#fff;border-radius:10px;padding:8px 12px;cursor:pointer}
+.dki-tab.active{background:#111827;color:#fff;border-color:#111827}
+.dki-tab-panel{display:none}
+.dki-tab-panel.active{display:block}
+.dki-card{background:#fff;border:1px solid #e5e7eb;border-radius:14px;box-shadow:0 1px 2px rgba(0,0,0,.04);overflow:hidden}
+.dki-card-header{padding:12px 14px;border-bottom:1px solid #eef2f7}
+.dki-card-title{margin:0;font-size:14px}
+.dki-card-body{padding:14px}
+.dki-form-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.dki-input{min-width:280px;max-width:100%;padding:8px 10px;border:1px solid #d0d5dd;border-radius:10px}
+.dki-btn-primary{border-radius:10px}
+.dki-btn-secondary{border-radius:10px;border:1px solid #d0d5dd;background:#fff}
+.dki-status{margin-top:10px;color:#334155}
+.dki-table-wrapper{margin-top:10px}
+.dki-table .dki-thumb{width:54px;height:54px;object-fit:cover;border-radius:10px;border:1px solid #eef2f7}
+.dki-title{font-weight:600}
+.dki-small{font-size:12px;color:#64748b;margin-top:4px}
+.dki-log{max-height:260px;overflow:auto;border:1px dashed #d0d5dd;border-radius:12px;padding:10px;background:#fafafa}
+.dki-log-info{color:#0f5132;margin-bottom:6px}
+.dki-log-error{color:#842029;margin-bottom:6px}
+.dki-mt-20{margin-top:20px}
+.dki-split{display:grid;grid-template-columns: 1fr 360px;gap:14px;align-items:start;margin-top:10px}
+@media (max-width: 1100px){.dki-split{grid-template-columns:1fr}}
+.dki-wc-cat-tree{border:1px solid #e5e7eb;border-radius:14px;overflow:hidden;background:#fff}
+.dki-wc-cat-tree-head{padding:10px 12px;border-bottom:1px solid #eef2f7;font-weight:600;font-size:13px}
+.dki-wc-cat-tree-body{padding:10px 12px;max-height:320px;overflow:auto}
+.dki-wc-cat-tree ul.categorychecklist{margin:0}
+.dki-wc-cat-tree li{margin:2px 0}
+.dki-form-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+@media (max-width: 900px){.dki-form-grid{grid-template-columns:1fr}}
+.dki-form-field label{display:block;font-weight:600;margin-bottom:6px}
