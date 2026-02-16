@@ -8,17 +8,85 @@ class DKI_Importer {
         return in_array($mode, ['auto','irr','toman'], true) ? $mode : 'auto';
     }
 
-    public static function convert_price(?int $price_irr): int {
-        if (!$price_irr) return 0;
+    public static function convert_price(?int $price_toman): int {
+        if (!$price_toman) return 0;
         $mode = self::get_price_mode();
         $currency = function_exists('get_woocommerce_currency') ? get_woocommerce_currency() : '';
-        $is_toman_currency = in_array($currency, ['IRT', 'TMN', 'TOMAN', 'تومان'], true);
+        $is_irr_currency = in_array($currency, ['IRR', 'RIAL', 'ریال'], true);
 
-        if ($mode === 'toman' || ($mode === 'auto' && $is_toman_currency)) {
-            return (int) floor($price_irr / 10);
+        // Digikala price source is toman. Convert to rial only when site currency is rial.
+        $price = (int)$price_toman;
+        if ($mode === 'irr' || ($mode === 'auto' && $is_irr_currency)) {
+            $price = (int) ($price_toman * 10);
         }
-        // irr or auto without toman currency
-        return (int) $price_irr;
+        return self::apply_price_rules($price);
+    }
+
+    public static function apply_price_rules(int $price): int {
+        if ($price <= 0) return 0;
+
+        $mode = (string)get_option('dki_price_adjust_mode', 'none');
+        $percent = (float)get_option('dki_price_adjust_percent', '0');
+        if ($percent < 0) $percent = 0.0;
+
+        if ($mode === 'increase' && $percent > 0) {
+            $price = (int)ceil($price * (1 + ($percent / 100)));
+        } elseif ($mode === 'decrease' && $percent > 0) {
+            $price = (int)floor($price * max(0, (1 - ($percent / 100))));
+        }
+
+        if ($price <= 0) return 0;
+
+        $round_mode = (string)get_option('dki_price_round_mode', 'none');
+        $zeros = (int)get_option('dki_price_round_zeros', 0);
+        if ($zeros < 0) $zeros = 0;
+        if ($zeros > 6) $zeros = 6;
+
+        if ($round_mode !== 'none' && $zeros > 0) {
+            $factor = (int)pow(10, $zeros);
+            if ($factor > 1) {
+                if ($round_mode === 'up') {
+                    $price = (int)(ceil($price / $factor) * $factor);
+                } elseif ($round_mode === 'down') {
+                    $price = (int)(floor($price / $factor) * $factor);
+                } elseif ($round_mode === 'nearest') {
+                    $price = (int)(round($price / $factor) * $factor);
+                }
+            }
+        }
+
+        return max(0, (int)$price);
+    }
+
+    public static function resolve_variation_price_from_dk(array $dk, string $woo_color_slug = ''): int {
+        $base_toman = isset($dk['price']) ? (int)$dk['price'] : 0;
+        $variants = isset($dk['variants']) && is_array($dk['variants']) ? $dk['variants'] : [];
+
+        if ($woo_color_slug !== '' && !empty($variants)) {
+            $best_toman = null;
+            foreach ($variants as $variant) {
+                if (!is_array($variant)) continue;
+                $color = $variant['color'] ?? null;
+                if (!is_array($color)) continue;
+
+                $title = (string)($color['title'] ?? $color['title_fa'] ?? '');
+                if ($title === '') continue;
+                if (sanitize_title($title) !== $woo_color_slug) continue;
+
+                $variant_price = isset($variant['price']['selling_price']) ? (int)$variant['price']['selling_price'] : 0;
+                if ($variant_price <= 0) continue;
+
+                if ($best_toman === null || $variant_price < $best_toman) {
+                    $best_toman = $variant_price;
+                }
+            }
+
+            if ($best_toman !== null && $best_toman > 0) {
+                return self::convert_price($best_toman);
+            }
+        }
+
+        return self::convert_price($base_toman);
     }
 
     public static function ensure_attribute_pa_color() {
